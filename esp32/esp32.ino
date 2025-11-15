@@ -37,12 +37,12 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 WebServer server(80);
 HTTPClient http;
 
-const char* ap_ssid = "GasGuard"; 
+const char* ap_ssid = "GasGuard";
 const char* ap_password = "12345678";
 
 String sta_ssid = "";
 String sta_password = "";
-String api_base_url = "https://ecomonitor-znv9.onrender.com/api";
+String api_base_url = "http://192.168.0.127/api"; // your API endpoint URL
 String device_id = "";
 String connectionStatus = "";
 String reading_time = "15";
@@ -56,6 +56,8 @@ const unsigned long apiInterval = 30000;
 const unsigned long commandCheckInterval = 10000;
 unsigned long readingInterval;
 unsigned long lastCheck = 0;
+unsigned long previousMillis = 0;
+const unsigned long displayReadingInterval = 5000;
 
 void checkConfiguration();
 void startAPMode();
@@ -68,7 +70,7 @@ String readStringFromEEPROM(int addr);
 void saveConfiguration();
 float readMQ7();
 void displayData(float ppm, int rawValue, float voltage);
-void displayMessage(String line1, String line2 = "", String line3 = "");
+void displayMessage(String line1, String line2 = "", String line3 = "", String line4 = "");
 void sendDataToAPI(float ppm, int rawValue, float voltage);
 void handleApiCommand(String command, String payload);
 String generateDeviceID();
@@ -116,9 +118,6 @@ void setup() {
   }
 
   checkConfiguration();
-  Serial.print("isConfigured = ");
-  Serial.println(isConfigured);
-
   if (isConfigured) {
     displayMessage("Connecting to", "saved WiFi...", sta_ssid);
     connectToWiFi();
@@ -133,7 +132,6 @@ void setup() {
   Serial.println("GasGuard Started!");
   Serial.println("Device ID: " + device_id);
   Serial.println("Reading interval: " + String(readingInterval/1000) + " seconds");
-  Serial.println("----------------------------");
 }
 
 float readMQ7() {
@@ -145,7 +143,7 @@ float readMQ7() {
   return ppm;
 }
 
-void displayData(float ppm, int rawValue, float voltage) {
+void displayData(float ppm, int rawValue, float voltage, String connectionStatus) {
   if (!screenEnabled) return;
   
   display.clearDisplay();
@@ -187,7 +185,7 @@ void displayData(float ppm, int rawValue, float voltage) {
   display.display();
 }
 
-void displayMessage(String line1, String line2, String line3) {
+void displayMessage(String line1, String line2, String line3, String line4) {
   if (!screenEnabled) return;
   
   display.clearDisplay();
@@ -195,10 +193,12 @@ void displayMessage(String line1, String line2, String line3) {
   display.setTextColor(WHITE);
   display.setCursor(0,0);
   display.println(line1);
-  display.setCursor(0,20);
+  display.setCursor(0,10);
   display.println(line2);
-  display.setCursor(0,40);
+  display.setCursor(0,20);
   display.println(line3);
+  display.setCursor(0,30);
+  display.println(line4);
   display.display();
 }
 
@@ -209,7 +209,7 @@ void loop() {
     static unsigned long lastDisplayUpdate = 0;
     if (millis() - lastDisplayUpdate > 2000) {
       lastDisplayUpdate = millis();
-      displayMessage("GasGuard AP Mode", "SSID: " + String(ap_ssid), "IP: " + WiFi.softAPIP().toString());
+      displayMessage("GasGuard AP Mode", "SSID: " + String(ap_ssid), "Password: " + String(ap_password), "URL: " + WiFi.softAPIP().toString());
     }
     return;
   }
@@ -220,25 +220,31 @@ void loop() {
     return;
   }
 
-  connectionStatus = "Online";
-  
-  if (lastReading == 0 || millis() - lastReading >= readingInterval) {
-    lastReading = millis();
-    
-    Serial.println("=== Reading sensor ===");
-    
-    // Read sensor values
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= displayReadingInterval) {
+    previousMillis = currentMillis; // оновлюємо час останнього виміру
+
     float ppm = readMQ7();
     int rawValue = analogRead(MQ7_PIN);
     float voltage = rawValue * (3.3 / 4095.0);
 
-    // Display data on screen
-    displayData(ppm, rawValue, voltage);
+    Serial.print("Raw: "); Serial.print(rawValue);
+    Serial.print(" | Voltage: "); Serial.print(voltage,2);
+    Serial.print("V | CO: "); Serial.print(ppm,1);
+    Serial.println(" ppm");
+
+    displayData(ppm, rawValue, voltage, connectionStatus);
+  }
     
-    // Send to API
+  if (lastReading == 0 || millis() - lastReading >= readingInterval) {
+    lastReading = millis();
+
+    float ppm = readMQ7();
+    int rawValue = analogRead(MQ7_PIN);
+    float voltage = rawValue * (3.3 / 4095.0);
     sendDataToAPI(ppm, rawValue, voltage);
     
-    Serial.println("=== Sensor reading complete ===");
+    Serial.println("=== Sensor readings sent ===");
   }
 }
 
@@ -249,11 +255,10 @@ void sendDataToAPI(float ppm, int rawValue, float voltage) {
     return;
   }
 
-  // FIXED: Use the correct endpoint that matches your Django URLs
   String url = api_base_url + "/sensor-readings/";
   Serial.println("Sending to: " + url);
 
-  DynamicJsonDocument doc(256); // Increased size for safety
+  DynamicJsonDocument doc(256);
   doc["device_id"] = device_id;
   doc["final_value"] = ppm;
   doc["raw_value"] = rawValue;
@@ -265,7 +270,7 @@ void sendDataToAPI(float ppm, int rawValue, float voltage) {
 
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(10000); // Increased timeout to 10 seconds
+  http.setTimeout(10000);
 
   Serial.println("Sending POST request...");
   int httpCode = http.POST(payload);
@@ -275,8 +280,7 @@ void sendDataToAPI(float ppm, int rawValue, float voltage) {
     Serial.println("HTTP Code: " + String(httpCode) + ", Response: " + response);
     connectionStatus = "Online";
     
-    // Check if response contains commands
-    if (response.length() > 2) { // Not empty response
+    if (response.length() > 2) {
       DynamicJsonDocument resDoc(256);
       DeserializationError error = deserializeJson(resDoc, response);
       
@@ -289,24 +293,17 @@ void sendDataToAPI(float ppm, int rawValue, float voltage) {
     }
   } else {
     Serial.println("HTTP POST failed: " + http.errorToString(httpCode));
-    connectionStatus = "Offline - " + http.errorToString(httpCode);
+    connectionStatus = "Offline";
   }
 
   http.end();
 }
 void handleApiCommand(String command, String payload) {
   Serial.println("Executing command: " + command + " | Payload: " + payload);
-  
-  if (command == "clear_eeprom") {
-    clearConfiguration();
-    displayMessage("EEPROM Cleared", "Restarting...", "");
-    delay(2000);
-    ESP.restart();
-  } 
-  else if (command == "restart" || command == "reboot") {
-    displayMessage("Restarting...", "", "");
-    delay(2000);
-    ESP.restart();
+  if (command == "disable_screen") {
+    screenEnabled = false;
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    Serial.println("Screen disabled by command");
   }
   else if (command == "enable_screen") {
     screenEnabled = true;
@@ -314,31 +311,21 @@ void handleApiCommand(String command, String payload) {
     Serial.println("Screen enabled by command");
     delay(2000);
   }
-  else if (command == "disable_screen") {
-    screenEnabled = false;
-    display.ssd1306_command(SSD1306_DISPLAYOFF);
-    Serial.println("Screen disabled by command");
-  }
-  else if (command == "update_api_url") {
-    api_base_url = payload;
-    writeStringToEEPROM(API_URL_ADDR, api_base_url);
-    displayMessage("API URL Updated", api_base_url, "");
+  else if (command == "reboot") {
+    displayMessage("Restarting...", "", "", "");
     delay(2000);
+    ESP.restart();
   }
   else if (command == "change_reading_time") {
     reading_time = payload;
     writeStringToEEPROM(READING_TIME, reading_time);
-    displayMessage("Reading time", "changed to " + payload + "m", "Restarting...");
+    displayMessage("Reading time", "changed to " + payload + "m", "Restarting...", "");
     delay(2000);
     ESP.restart();
   }
-  else if (command == "display_message") {
-    displayMessage("Server Message", payload, "");
-    delay(5000);
-  }
   else if (command == "factory_reset") {
     clearConfiguration();
-    displayMessage("Factory Reset", "Restarting...", "");
+    displayMessage("Factory Reset", "Restarting...", "", "");
     delay(2000);
     ESP.restart();
   }
@@ -346,7 +333,6 @@ void handleApiCommand(String command, String payload) {
     Serial.println("Unknown command: " + command);
   }
 }
-
 
 String generateDeviceID() {
   String id = "GG-";
@@ -426,6 +412,9 @@ void setupWebServer() {
           
           <label for="password">WiFi Password:</label>
           <input type="password" id="password" name="password" placeholder="Enter your WiFi password">
+
+          <label for="api_url">API endpoint URL:</label>
+          <input type="text" id="api_url" name="api_url" placeholder="https://ecomonitor-znv9.onrender.com/api">
           
           <input type="submit" value="Save & Connect">
         </form>
@@ -441,14 +430,11 @@ void setupWebServer() {
       sta_ssid = server.arg("ssid");
       sta_password = server.arg("password");
 
-      
-      // Update API URL if provided
       if (server.hasArg("api_url") && server.arg("api_url").length() > 0) {
         api_base_url = server.arg("api_url");
         writeStringToEEPROM(API_URL_ADDR, api_base_url);
       }
       
-      // Save to EEPROM
       saveConfiguration();
       
       // Send success response
@@ -517,19 +503,16 @@ void connectToWiFi() {
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
     
-    // IMPORTANT: Make sure we're marked as configured
     isConfigured = true;
-    connectionStatus = "Online";
-    
-    displayMessage("WiFi Connected!", "IP: " + WiFi.localIP().toString(), "Reading sensor...");
+
+    displayMessage("WiFi Connected!", "IP: " + WiFi.localIP().toString(), "Reading sensor...", "");
     delay(2000);
-    
-    // Force an immediate sensor reading
-    lastReading = 0; // This will trigger reading in next loop()
+
+    lastReading = 0;
     
   } else {
     Serial.println("\nFailed to connect to WiFi. Starting AP mode...");
-    displayMessage("WiFi Connection", "Failed!", "Starting AP mode...");
+    displayMessage("WiFi Connection", "Failed!", "Starting AP mode...", "");
     delay(2000);
     clearConfiguration();
     startAPMode();
