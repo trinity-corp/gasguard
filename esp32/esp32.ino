@@ -9,7 +9,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
-#include <EEPROM.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -24,25 +24,19 @@
 #define RL 10
 #define RO_CLEAN_AIR 9.8
 
-#define EEPROM_SIZE 512
-#define SSID_ADDR 0
-#define PASS_ADDR 32
-#define CONFIGURED_FLAG_ADDR 64
-#define API_URL_ADDR 160
-#define DEVICE_ID_ADDR 128
-#define API_TOKEN_ADDR 224
-#define READING_TIME 256
-
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Preferences prefs;
+
 WebServer server(80);
 HTTPClient http;
 
 const char* ap_ssid = "GasGuard";
 const char* ap_password = "12345678";
 
+// Initializating variables
 String sta_ssid = "";
 String sta_password = "";
-String api_base_url = "http://192.168.0.127/api"; // your API endpoint URL
+String api_base_url = "http://0.0.0.0:8000/api"; // your API endpoint URL
 String device_id = "";
 String connectionStatus = "";
 String reading_time = "15";
@@ -59,14 +53,13 @@ unsigned long lastCheck = 0;
 unsigned long previousMillis = 0;
 const unsigned long displayReadingInterval = 5000;
 
+// Initializing functions
 void checkConfiguration();
 void startAPMode();
 void setupWebServer();
 void connectToWiFi();
 void checkWiFiConnection();
 void clearConfiguration();
-void writeStringToEEPROM(int addr, String str);
-String readStringFromEEPROM(int addr);
 void saveConfiguration();
 float readMQ7();
 void displayData(float ppm, int rawValue, float voltage);
@@ -77,46 +70,43 @@ String generateDeviceID();
 
 void setup() {
   Serial.begin(115200);
-  EEPROM.begin(EEPROM_SIZE);
+  prefs.begin("config", false);
 
-  device_id = readStringFromEEPROM(DEVICE_ID_ADDR);
+  // Enable OLED screen using defined OLED_SDA and OLED_SCL adressess
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("SSD1306 allocation failed")); 
+    for(;;); // If screen does not starts device will not work
+  }
+
+  // Get the device_id
+  device_id = prefs.getString("device_id");
   if (device_id.length() == 0) {
-    device_id = generateDeviceID();
-    writeStringToEEPROM(DEVICE_ID_ADDR, device_id);
+    device_id = generateDeviceID(); // If device_id empty generate a new one 
+    prefs.putString("device_id", device_id); // Write new device_id to NVS
   }
 
-  reading_time = readStringFromEEPROM(READING_TIME);
-  if (reading_time.length() == 0) {
-      reading_time = "15";
-      writeStringToEEPROM(READING_TIME, reading_time);
-  }
+  // Get the API URL
+  String saved_api_url = prefs.getString("api_base_url", api_base_url);
 
-  int reading_minutes = reading_time.toInt();
+  // Define reading time
+  reading_time = prefs.getString("reading_time", "15");
+  int reading_minutes = reading_time.toInt(); // Convert string reading_time to integer
   if (reading_minutes <= 0 || reading_minutes > 1440) {
     reading_minutes = 15;
     reading_time = "15";
-    writeStringToEEPROM(READING_TIME, reading_time);
-    Serial.println("Invalid reading time, set to default: 1 minute");
+    prefs.putString("reading_time", reading_time);
+    Serial.println("Invalid reading time, set to default: 15 minutes");
   }
-
   readingInterval = (unsigned long)reading_minutes * 60UL * 1000UL;
 
-  Serial.println("Reading interval: " + String(reading_minutes) + " minutes = " + String(readingInterval) + " ms");
 
-  Wire.begin(OLED_SDA, OLED_SCL);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;);
-  }
+  Serial.println("Reading interval: " + String(reading_minutes) + " minutes = " + String(readingInterval) + " ms");
 
   displayMessage("GasGuard", "Device ID: " + device_id, "Initializing...");
   delay(1000);
 
-  String saved_api_url = readStringFromEEPROM(API_URL_ADDR);
-  if (saved_api_url.length() > 0) {
-    api_base_url = saved_api_url;
-  }
-
+  // Checking configuration
   checkConfiguration();
   if (isConfigured) {
     displayMessage("Connecting to", "saved WiFi...", sta_ssid);
@@ -127,11 +117,22 @@ void setup() {
     setupWebServer();
   }
 
+  // Connection status is unknown before readings sent
   connectionStatus = "Unknown";
 
   Serial.println("GasGuard Started!");
   Serial.println("Device ID: " + device_id);
   Serial.println("Reading interval: " + String(readingInterval/1000) + " seconds");
+
+  // Uncomment for verbose mode
+  // Serial.println("=== Verbose data ===");
+  // Serial.println("device_id: " + prefs.getString("device_id"));
+  // Serial.println("sta_ssid: " + prefs.getString("sta_ssid"));
+  // Serial.println("sta_password: " +prefs.getString("sta_password"));
+  // Serial.println("isConfigured: " + prefs.getBool("isConfigured"));
+  // Serial.println("Reading time: " + prefs.getString("reading_time"));
+  // Serial.println("API URL: " + prefs.getString("api_base_url"));
+
 }
 
 float readMQ7() {
@@ -204,7 +205,8 @@ void displayMessage(String line1, String line2, String line3, String line4) {
 
 void loop() {
   server.handleClient();
-
+  isConfigured = prefs.getBool("isConfigured");
+  
   if (!isConfigured) {
     static unsigned long lastDisplayUpdate = 0;
     if (millis() - lastDisplayUpdate > 2000) {
@@ -318,7 +320,7 @@ void handleApiCommand(String command, String payload) {
   }
   else if (command == "change_reading_time") {
     reading_time = payload;
-    writeStringToEEPROM(READING_TIME, reading_time);
+    prefs.putString("reading_time", payload);
     displayMessage("Reading time", "changed to " + payload + "m", "Restarting...", "");
     delay(2000);
     ESP.restart();
@@ -334,31 +336,37 @@ void handleApiCommand(String command, String payload) {
   }
 }
 
+/* 
+  Function for generating device ID using MAC address
+  The generated ID's will always be the same and unique* 
+*/ 
 String generateDeviceID() {
-  String id = "GG-";
-  id += String((uint32_t)ESP.getEfuseMac(), HEX);
+  String id = "GG-"; // 'GG' stands for GasGuard
+  id += String((uint32_t)ESP.getEfuseMac(), HEX); // *This function gets only the last 32 bits of MAC address, so in very rare situations the ID's may repeat
   id.toUpperCase();
   return id;
 }
 
+// Function for checking configuration
 void checkConfiguration() {
-  byte configuredFlag = EEPROM.read(CONFIGURED_FLAG_ADDR);
-  if (configuredFlag == 0xFF) {
-    sta_ssid = readStringFromEEPROM(SSID_ADDR);
-    sta_password = readStringFromEEPROM(PASS_ADDR);
-    reading_time = readStringFromEEPROM(READING_TIME);
-    
+  isConfigured = prefs.getBool("isConfigured");
+  if (isConfigured == true) {
+    sta_ssid = prefs.getString("sta_ssid");
+    sta_password = prefs.getString("sta_password");
+    reading_time = prefs.getString("reading_time");
+
     if (sta_ssid.length() > 0) {
-      isConfigured = true;
+      prefs.putBool("isConfigured", true);
       Serial.println("Device is configured");
     } else {
-      isConfigured = false;
+      prefs.putBool("isConfigured", false);
     }
   } else {
-    isConfigured = false;
+    prefs.putBool("isConfigured", false);
   }
 }
 
+// Function for starting the access point mode
 void startAPMode() {
   Serial.println("Starting AP mode for configuration...");
   WiFi.mode(WIFI_AP);
@@ -370,6 +378,7 @@ void startAPMode() {
   Serial.println(ap_ssid);
 }
 
+// Function for setting up the website
 void setupWebServer() {
   server.on("/", HTTP_GET, []() {
     String html = R"=====(
@@ -414,7 +423,7 @@ void setupWebServer() {
           <input type="password" id="password" name="password" placeholder="Enter your WiFi password">
 
           <label for="api_url">API endpoint URL:</label>
-          <input type="text" id="api_url" name="api_url" placeholder="https://ecomonitor-znv9.onrender.com/api">
+          <input type="text" id="api_url" name="api_url" placeholder="http://0.0.0.0:8000/api">
           
           <input type="submit" value="Save & Connect">
         </form>
@@ -425,6 +434,7 @@ void setupWebServer() {
     server.send(200, "text/html", html);
   });
 
+  // After pressing 'Save & Connect' button
   server.on("/configure", HTTP_POST, []() {
     if (server.hasArg("ssid")) {
       sta_ssid = server.arg("ssid");
@@ -432,7 +442,6 @@ void setupWebServer() {
 
       if (server.hasArg("api_url") && server.arg("api_url").length() > 0) {
         api_base_url = server.arg("api_url");
-        writeStringToEEPROM(API_URL_ADDR, api_base_url);
       }
       
       saveConfiguration();
@@ -476,15 +485,19 @@ void setupWebServer() {
   Serial.println("HTTP server started");
 }
 
+// Function for saving configuration to NVS
 void saveConfiguration() {  
-  writeStringToEEPROM(SSID_ADDR, sta_ssid);
-  writeStringToEEPROM(PASS_ADDR, sta_password);
-  EEPROM.write(CONFIGURED_FLAG_ADDR, 0xFF);
-  EEPROM.commit();
-  Serial.println("Configuration saved to EEPROM");
+  prefs.putString("sta_ssid", sta_ssid);
+  prefs.putString("sta_password", sta_password);
+  prefs.putString("api_base_url", api_base_url);
+  prefs.putBool("isConfigured", true);
+  Serial.println("Configuration saved to NVS");
 }
 
-void connectToWiFi() {
+// Function for connecting to a WiFi
+void connectToWiFi() {  
+  sta_ssid = prefs.getString("sta_ssid", sta_ssid);
+  sta_password = prefs.getString("sta_password", sta_password);
   Serial.println("Connecting to saved WiFi...");
   Serial.println("SSID: " + sta_ssid);
   
@@ -502,8 +515,6 @@ void connectToWiFi() {
     Serial.println("\nConnected to WiFi!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
-    
-    isConfigured = true;
 
     displayMessage("WiFi Connected!", "IP: " + WiFi.localIP().toString(), "Reading sensor...", "");
     delay(2000);
@@ -514,10 +525,8 @@ void connectToWiFi() {
     Serial.println("\nFailed to connect to WiFi. Starting AP mode...");
     displayMessage("WiFi Connection", "Failed!", "Starting AP mode...", "");
     delay(2000);
-    clearConfiguration();
     startAPMode();
     setupWebServer();
-    isConfigured = false;
   }
 }
 void checkWiFiConnection() {
@@ -533,30 +542,7 @@ void checkWiFiConnection() {
 }
 
 void clearConfiguration() {
-  for (int i = 0; i < 96; i++) {
-    EEPROM.write(i, 0);
-  }
-  EEPROM.commit();
+  prefs.clear();
+  prefs.putBool("isConfigured", false);
   Serial.println("Configuration cleared");
-}
-
-void writeStringToEEPROM(int addr, String str) {
-  int len = str.length();
-  EEPROM.write(addr, len);
-  for (int i = 0; i < len; i++) {
-    EEPROM.write(addr + 1 + i, str[i]);
-  }
-  EEPROM.commit();
-}
-
-String readStringFromEEPROM(int addr) {
-  int len = EEPROM.read(addr);
-  if (len <= 0 || len > 50) return "";
-  
-  char data[len + 1];
-  for (int i = 0; i < len; i++) {
-    data[i] = EEPROM.read(addr + 1 + i);
-  }
-  data[len] = '\0';
-  return String(data);
 }
