@@ -1,8 +1,12 @@
 /*
-  GasGuard
-  created at 16 september 2025
-  by Andriy Tymchuk
-  https://github.com/trinity-corp/gasguard/
+  GasGuard firmware
+  Device: ESP32
+  Description: Reads gas sensor data (MQ-7), processes values, 
+               and sends them to the server or cloud service.
+  Author: Andriy Tymchuk
+  Repository: https://github.com/trinity-corp/gasguard/
+
+  Note: Sensor readings (CO ppm) are approximate and depend on MQ-7 limitations.
 */
 
 #include <Wire.h>
@@ -14,42 +18,43 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// Defining screen settings
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
-#define OLED_SDA 21
-#define OLED_SCL 22
+#define OLED_ADDR 0x3C // I2C address used by the display
+#define OLED_SDA 21    // Display's SDA pin number
+#define OLED_SCL 22    // Display's SCL pin number
 
+// Defining MQ7 settings
 #define MQ7_PIN 34
-#define RL 10
-#define RO_CLEAN_AIR 9.8
+#define RL 10 // Value used in formulas
+#define RO_CLEAN_AIR 9.8 // Value used in formulas
 
+// Intializing display
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Initializing NVS
 Preferences prefs;
 
+// Initializing webserver
 WebServer server(80);
 HTTPClient http;
 
-const char* ap_ssid = "GasGuard";
-const char* ap_password = "12345678";
+const char* ap_ssid = "GasGuard";     // Access point's SSID
+const char* ap_password = "12345678"; // Access point's password
 
 // Initializating variables
 String sta_ssid = "";
 String sta_password = "";
-String api_base_url = "http://0.0.0.0:8000/api"; // your API endpoint URL
 String device_id = "";
 String connectionStatus = "";
-String reading_time = "15";
+String api_base_url = "https://ecomonitor-znv9.onrender.com/api"; // API endpoint URL used by default
+String reading_time = "15"; // Default reading interval
 
 bool screenEnabled = true;
 bool isConfigured = false;
 unsigned long lastReading = 0;
-unsigned long lastApiCall = 0;
-unsigned long lastCommandCheck = 0;
-const unsigned long apiInterval = 30000;
-const unsigned long commandCheckInterval = 10000;
 unsigned long readingInterval;
-unsigned long lastCheck = 0;
 unsigned long previousMillis = 0;
 const unsigned long displayReadingInterval = 5000;
 
@@ -58,13 +63,12 @@ void checkConfiguration();
 void startAPMode();
 void setupWebServer();
 void connectToWiFi();
-void checkWiFiConnection();
 void clearConfiguration();
 void saveConfiguration();
-float readMQ7();
-void displayData(float ppm, int rawValue, float voltage);
-void displayMessage(String line1, String line2 = "", String line3 = "", String line4 = "");
-void sendDataToAPI(float ppm, int rawValue, float voltage);
+float readSensor();
+void displayData(float final_value, int rawValue, float voltage);
+void displayMessage(String line1 = "", String line2 = "", String line3 = "", String line4 = "");
+void sendDataToAPI(float final_value, int rawValue, float voltage);
 void handleApiCommand(String command, String payload);
 String generateDeviceID();
 
@@ -87,7 +91,7 @@ void setup() {
   }
 
   // Get the API URL
-  String saved_api_url = prefs.getString("api_base_url", api_base_url);
+  String api_base_url = prefs.getString("api_base_url", api_base_url);
 
   // Define reading time
   reading_time = prefs.getString("reading_time", "15");
@@ -99,7 +103,6 @@ void setup() {
     Serial.println("Invalid reading time, set to default: 15 minutes");
   }
   readingInterval = (unsigned long)reading_minutes * 60UL * 1000UL;
-
 
   Serial.println("Reading interval: " + String(reading_minutes) + " minutes = " + String(readingInterval) + " ms");
 
@@ -130,21 +133,74 @@ void setup() {
   // Serial.println("sta_ssid: " + prefs.getString("sta_ssid"));
   // Serial.println("sta_password: " +prefs.getString("sta_password"));
   // Serial.println("isConfigured: " + prefs.getBool("isConfigured"));
-  // Serial.println("Reading time: " + prefs.getString("reading_time"));
+  // Serial.println("Reading interval: " + prefs.getString("reading_time"));
   // Serial.println("API URL: " + prefs.getString("api_base_url"));
 
 }
 
-float readMQ7() {
+void loop() {
+  server.handleClient();
+  isConfigured = prefs.getBool("isConfigured");
+  
+  // If device not configured (Was not setted up or factory reset)
+  if (!isConfigured) {
+    static unsigned long lastDisplayUpdate = 0;
+    if (millis() - lastDisplayUpdate > 2000) {
+      lastDisplayUpdate = millis();
+      displayMessage("GasGuard AP Mode", "SSID: " + String(ap_ssid), "Password: " + String(ap_password), "URL: " + WiFi.softAPIP().toString());
+    }
+    return;
+  }
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= displayReadingInterval) {
+    previousMillis = currentMillis;
+
+    float final_value = readSensor();
+    int rawValue = analogRead(MQ7_PIN);        // Only for GasGuard
+    float voltage = rawValue * (3.3 / 4095.0); // Only for GasGuard
+
+    // Only for GasGuard
+    Serial.print("Raw: "); Serial.print(rawValue);
+    Serial.print(" | Voltage: "); Serial.print(voltage,2); 
+    Serial.print("V | CO: "); Serial.print(final_value,1);
+    Serial.println(" ppm"); //
+
+    displayData(final_value, rawValue, voltage, connectionStatus);
+  }
+    
+  if (lastReading == 0 || millis() - lastReading >= readingInterval) {
+    lastReading = millis();
+
+    float final_value = readSensor();
+    int rawValue = analogRead(MQ7_PIN);        // Only for GasGuard
+    float voltage = rawValue * (3.3 / 4095.0); // Only for GasGuard
+    sendDataToAPI(final_value, rawValue, voltage);
+    
+    Serial.println("=== Sensor readings sent ===");
+  }
+}
+
+// Function for reading your sensor readings
+float readSensor() {
+  /*
+    GasGuard uses MQ7 sensor to obtain approximate CO readings.
+    The device reads the ADC value, converts it to voltage, and calculates the sensor internal resistance (RS).
+    This resistance is compared to the calibrated clean-air resistance (RO), forming a ratio used in an approximate CO concentration formula. 
+    The result provides an estimated CO value in ppm('final_value'). 
+    The measurement is not accurate and depends on sensor conditions, calibration, and the MQ-7 heating cycle.
+    In this project, the values are provided only as a demonstration of how gas data may be transmitted.
+  */ 
   int sensorValue = analogRead(MQ7_PIN);
   float voltage = sensorValue * (3.3 / 4095.0);
   float RS = ((5.0 - voltage) / voltage) * RL;
   float ratio = RS / RO_CLEAN_AIR;
-  float ppm = 100 * pow(ratio, -2.95);
-  return ppm;
+  float final_value = 100 * pow(ratio, -2.95); // final_value changed to ppm for unification 
+  return final_value;
 }
 
-void displayData(float ppm, int rawValue, float voltage, String connectionStatus) {
+// Function for displaying data on the OLED screen
+void displayData(float final_value, int rawValue, float voltage, String connectionStatus) {
   if (!screenEnabled) return;
   
   display.clearDisplay();
@@ -163,22 +219,22 @@ void displayData(float ppm, int rawValue, float voltage, String connectionStatus
 
   display.setCursor(0,20);
   display.setTextSize(2);
-  if (ppm < 0.01) {
+  if (final_value < 0.01) {
     display.print("<0.01");
-  } else if (ppm < 1.0) {
-    display.print(ppm, 3);
-  } else if (ppm < 10.0) {
-    display.print(ppm, 2);
+  } else if (final_value < 1.0) {
+    display.print(final_value, 3);
+  } else if (final_value < 10.0) {
+    display.print(final_value, 2);
   } else {
-    display.print(ppm, 1);
+    display.print(final_value, 1);
   }
   display.setTextSize(1);
   display.println(" ppm");
   
+  // Only for GasGuard
   display.setCursor(0,40);
   display.print("Raw: ");
   display.print(rawValue);
-  
   display.setCursor(80,40);
   display.print(voltage, 3);
   display.println("V");
@@ -203,68 +259,22 @@ void displayMessage(String line1, String line2, String line3, String line4) {
   display.display();
 }
 
-void loop() {
-  server.handleClient();
-  isConfigured = prefs.getBool("isConfigured");
-  
-  if (!isConfigured) {
-    static unsigned long lastDisplayUpdate = 0;
-    if (millis() - lastDisplayUpdate > 2000) {
-      lastDisplayUpdate = millis();
-      displayMessage("GasGuard AP Mode", "SSID: " + String(ap_ssid), "Password: " + String(ap_password), "URL: " + WiFi.softAPIP().toString());
-    }
-    return;
-  }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    connectionStatus = "Reconnecting";
-    checkWiFiConnection();
-    return;
-  }
-
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= displayReadingInterval) {
-    previousMillis = currentMillis; // оновлюємо час останнього виміру
-
-    float ppm = readMQ7();
-    int rawValue = analogRead(MQ7_PIN);
-    float voltage = rawValue * (3.3 / 4095.0);
-
-    Serial.print("Raw: "); Serial.print(rawValue);
-    Serial.print(" | Voltage: "); Serial.print(voltage,2);
-    Serial.print("V | CO: "); Serial.print(ppm,1);
-    Serial.println(" ppm");
-
-    displayData(ppm, rawValue, voltage, connectionStatus);
-  }
-    
-  if (lastReading == 0 || millis() - lastReading >= readingInterval) {
-    lastReading = millis();
-
-    float ppm = readMQ7();
-    int rawValue = analogRead(MQ7_PIN);
-    float voltage = rawValue * (3.3 / 4095.0);
-    sendDataToAPI(ppm, rawValue, voltage);
-    
-    Serial.println("=== Sensor readings sent ===");
-  }
-}
-
-void sendDataToAPI(float ppm, int rawValue, float voltage) {
+void sendDataToAPI(float final_value, int rawValue, float voltage) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Cannot send data - WiFi not connected");
-    connectionStatus = "Offline";
+    connectionStatus = "Offline"; // Connection status is offline when can not connect to the API but WiFi
     return;
   }
 
-  String url = api_base_url + "/sensor-readings/";
+  String url = api_base_url + "/sensor-readings/"; // Device will send to API page /sensor-readings/
   Serial.println("Sending to: " + url);
 
   DynamicJsonDocument doc(256);
   doc["device_id"] = device_id;
-  doc["final_value"] = ppm;
-  doc["raw_value"] = rawValue;
-  doc["voltage"] = voltage;
+  doc["final_value"] = final_value;
+  doc["raw_value"] = rawValue; // Only for GasGuard
+  doc["voltage"] = voltage;    // Only for GasGuard
 
   String payload;
   serializeJson(doc, payload);
@@ -287,6 +297,7 @@ void sendDataToAPI(float ppm, int rawValue, float voltage) {
       DeserializationError error = deserializeJson(resDoc, response);
       
       if (!error && resDoc.containsKey("command")) {
+        // If command found in response
         String command = resDoc["command"];
         String payload = resDoc["payload"] | "";
         Serial.println("Found command in response: " + command);
@@ -295,41 +306,46 @@ void sendDataToAPI(float ppm, int rawValue, float voltage) {
     }
   } else {
     Serial.println("HTTP POST failed: " + http.errorToString(httpCode));
-    connectionStatus = "Offline";
+    connectionStatus = "Offline"; // Connection status changes to offline when API not available
   }
 
   http.end();
 }
+
+// Functions for handling commands being in HTTP responses payloads sent by API
 void handleApiCommand(String command, String payload) {
   Serial.println("Executing command: " + command + " | Payload: " + payload);
   if (command == "disable_screen") {
-    screenEnabled = false;
-    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    // Disable screen command
+    screenEnabled = false; // Mark screen as disabled
+    display.ssd1306_command(SSD1306_DISPLAYOFF); // Disable screen using Adafruit library
     Serial.println("Screen disabled by command");
   }
   else if (command == "enable_screen") {
-    screenEnabled = true;
-    display.ssd1306_command(SSD1306_DISPLAYON);
+    // Enable screen command
+    screenEnabled = true; // Mark screen as enabled
+    display.ssd1306_command(SSD1306_DISPLAYON); // Enable screen using Adafruit library
     Serial.println("Screen enabled by command");
-    delay(2000);
   }
   else if (command == "reboot") {
-    displayMessage("Restarting...", "", "", "");
+    // Reboot ESP command
+    displayMessage("Rebooting...", "", "", "");
     delay(2000);
-    ESP.restart();
+    ESP.restart(); // Restart ESP
   }
   else if (command == "change_reading_time") {
-    reading_time = payload;
-    prefs.putString("reading_time", payload);
+    // This command updates the reading interval using the value provided in the payload
+    prefs.putString("reading_time", payload); // Save new interval to NVS
     displayMessage("Reading time", "changed to " + payload + "m", "Restarting...", "");
     delay(2000);
-    ESP.restart();
+    ESP.restart(); // Restart ESP
   }
   else if (command == "factory_reset") {
+    // Function for clearing the ESP NVS
     clearConfiguration();
     displayMessage("Factory Reset", "Restarting...", "", "");
     delay(2000);
-    ESP.restart();
+    ESP.restart(); // Restart ESP
   }
   else {
     Serial.println("Unknown command: " + command);
@@ -413,6 +429,7 @@ void setupWebServer() {
         
         <div class="device-info">
           <strong>Device ID:</strong> )=====" + device_id + R"=====(<br>
+          <strong>API URL:</strong> )=====" + api_base_url + R"=====(<br>
         </div>
         
         <form action="/configure" method="post">
@@ -421,9 +438,6 @@ void setupWebServer() {
           
           <label for="password">WiFi Password:</label>
           <input type="password" id="password" name="password" placeholder="Enter your WiFi password">
-
-          <label for="api_url">API endpoint URL:</label>
-          <input type="text" id="api_url" name="api_url" placeholder="http://0.0.0.0:8000/api">
           
           <input type="submit" value="Save & Connect">
         </form>
@@ -439,10 +453,6 @@ void setupWebServer() {
     if (server.hasArg("ssid")) {
       sta_ssid = server.arg("ssid");
       sta_password = server.arg("password");
-
-      if (server.hasArg("api_url") && server.arg("api_url").length() > 0) {
-        api_base_url = server.arg("api_url");
-      }
       
       saveConfiguration();
       
@@ -489,7 +499,6 @@ void setupWebServer() {
 void saveConfiguration() {  
   prefs.putString("sta_ssid", sta_ssid);
   prefs.putString("sta_password", sta_password);
-  prefs.putString("api_base_url", api_base_url);
   prefs.putBool("isConfigured", true);
   Serial.println("Configuration saved to NVS");
 }
@@ -527,17 +536,6 @@ void connectToWiFi() {
     delay(2000);
     startAPMode();
     setupWebServer();
-  }
-}
-void checkWiFiConnection() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi connection lost. Reconnecting...");
-    WiFi.reconnect();
-    delay(2000);
-    
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("Reconnection failed.");
-    }
   }
 }
 
